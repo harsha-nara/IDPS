@@ -1,0 +1,177 @@
+import scapy.all as scapy
+import sqlite3
+import re
+from datetime import datetime
+import threading
+import tkinter as tk
+from tkinter import messagebox, scrolledtext
+
+def setup_database():
+    conn = sqlite3.connect('ids.db', check_same_thread=False)
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS rules (
+                        id INTEGER PRIMARY KEY,
+                        rule_name TEXT,
+                        pattern TEXT,
+                        action TEXT
+                    )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS logs (
+                        id INTEGER PRIMARY KEY,
+                        timestamp TEXT,
+                        source_ip TEXT,
+                        destination_ip TEXT,
+                        protocol TEXT,
+                        message TEXT
+                    )''')
+    conn.commit()
+    return conn
+
+def add_rule(conn, rule_name, pattern, action):
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO rules (rule_name, pattern, action) VALUES (?, ?, ?)",
+                  (rule_name, pattern, action))
+    conn.commit()
+    messagebox.showinfo("Success", f"Rule '{rule_name}' added successfully.")
+
+def log_event(conn, source_ip, destination_ip, protocol, message, app_instance):
+    cursor = conn.cursor()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cursor.execute("INSERT INTO logs (timestamp, source_ip, destination_ip, protocol, message) VALUES (?, ?, ?, ?, ?)",
+                  (timestamp, source_ip, destination_ip, protocol, message))
+    conn.commit()
+    app_instance.update_logs_display()
+
+def analyze_packet(packet, conn, app_instance):
+    if packet.haslayer(scapy.IP):
+        source_ip = packet[scapy.IP].src
+        destination_ip = packet[scapy.IP].dst
+        protocol = packet[scapy.IP].proto
+
+        if packet.haslayer(scapy.ICMP):
+            cursor = conn.cursor()
+            cursor.execute("SELECT rule_name, pattern, action FROM rules WHERE rule_name = 'Block Ping Requests'")
+            rule = cursor.fetchone()
+
+            if rule:
+                rule_name, pattern, action = rule
+                message = f"Rule '{rule_name}' triggered: ICMP packet detected from {source_ip}"
+                log_event(conn, source_ip, destination_ip, "ICMP", message, app_instance)
+
+                if action == "block":
+                    block_ip(source_ip)
+                elif action == "alert":
+                    send_alert(source_ip, destination_ip, "ICMP", message)
+
+        if packet.haslayer(scapy.Raw):
+            payload = packet[scapy.Raw].load.decode('utf-8', errors='ignore')
+            cursor = conn.cursor()
+            cursor.execute("SELECT rule_name, pattern, action FROM rules")
+            rules = cursor.fetchall()
+
+            for rule in rules:
+                rule_name, pattern, action = rule
+                if re.search(pattern, payload, re.IGNORECASE):
+                    message = f"Rule '{rule_name}' triggered: {pattern}"
+                    log_event(conn, source_ip, destination_ip, protocol, message, app_instance)
+
+                    if action == "block":
+                        block_ip(source_ip)
+                    elif action == "alert":
+                        send_alert(source_ip, destination_ip, protocol, message)
+
+def block_ip(ip):
+    print(f"Blocking IP: {ip}")
+
+def send_alert(source_ip, destination_ip, protocol, message):
+    print(f"ALERT: {message}")
+
+def start_sniffing(app_instance):
+    conn = app_instance.conn
+    print("Starting packet sniffing...")
+    app_instance.sniffing = True
+    scapy.sniff(prn=lambda packet: analyze_packet(packet, conn, app_instance), store=False, stop_filter=lambda p: not app_instance.sniffing)
+
+class IDPSApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Intrusion Detection and Prevention System")
+        self.conn = setup_database()
+        self.sniffing = False
+
+        self.start_button = tk.Button(root, text="Start Sniffing", command=self.start_sniffing_thread)
+        self.start_button.pack(pady=10)
+
+        self.stop_button = tk.Button(root, text="Stop Sniffing", command=self.stop_sniffing, state=tk.DISABLED)
+        self.stop_button.pack(pady=10)
+
+        self.rule_name_label = tk.Label(root, text="Rule Name:")
+        self.rule_name_label.pack()
+        self.rule_name_entry = tk.Entry(root)
+        self.rule_name_entry.pack()
+
+        self.pattern_label = tk.Label(root, text="Pattern:")
+        self.pattern_label.pack()
+        self.pattern_entry = tk.Entry(root)
+        self.pattern_entry.pack()
+
+        self.action_label = tk.Label(root, text="Action (block/alert):")
+        self.action_label.pack()
+        self.action_entry = tk.Entry(root)
+        self.action_entry.pack()
+
+        self.add_rule_button = tk.Button(root, text="Add Rule", command=self.add_rule)
+        self.add_rule_button.pack(pady=10)
+
+        self.logs_label = tk.Label(root, text="Detected Events:")
+        self.logs_label.pack()
+        self.logs_text = scrolledtext.ScrolledText(root, height=15, width=80)
+        self.logs_text.pack()
+
+        self.clear_logs_button = tk.Button(root, text="Clear Logs", command=self.clear_logs)
+        self.clear_logs_button.pack(pady=10)
+
+        self.update_logs_display()
+
+    def start_sniffing_thread(self):
+        self.start_button.config(state=tk.DISABLED)
+        self.stop_button.config(state=tk.NORMAL)
+        self.sniffing_thread = threading.Thread(target=start_sniffing, args=(self,))
+        self.sniffing_thread.daemon = True
+        self.sniffing_thread.start()
+
+    def stop_sniffing(self):
+        self.sniffing = False
+        self.start_button.config(state=tk.NORMAL)
+        self.stop_button.config(state=tk.DISABLED)
+        print("Stopping packet sniffing...")
+
+    def add_rule(self):
+        rule_name = self.rule_name_entry.get()
+        pattern = self.pattern_entry.get()
+        action = self.action_entry.get()
+        if rule_name and pattern and action:
+            add_rule(self.conn, rule_name, pattern, action)
+            self.rule_name_entry.delete(0, tk.END)
+            self.pattern_entry.delete(0, tk.END)
+            self.action_entry.delete(0, tk.END)
+        else:
+            messagebox.showwarning("Input Error", "Please fill all fields.")
+
+    def update_logs_display(self):
+        self.logs_text.delete(1.0, tk.END)
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM logs ORDER BY timestamp DESC")
+        logs = cursor.fetchall()
+        for log in logs:
+            self.logs_text.insert(tk.END, f"{log[1]} | {log[2]} -> {log[3]} | {log[4]} | {log[5]}\n")
+
+    def clear_logs(self):
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM logs")
+        self.conn.commit()
+        self.update_logs_display()
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = IDPSApp(root)
+    root.mainloop()
